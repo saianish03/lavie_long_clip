@@ -372,7 +372,6 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         attention_mask: Optional[torch.Tensor] = None,
         use_image_num: int = 0,
         return_dict: bool = True,
-        **kwargs
     ) -> Union[UNet3DConditionOutput, Tuple]:
         r"""
         Args:
@@ -453,8 +452,6 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
 
         # pre-process
         sample = self.conv_in(sample)
-        
-        clip_text_feature = kwargs['clip_text_feature'] # works
 
         # down
         down_block_res_samples = (sample,)
@@ -466,7 +463,6 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                     encoder_hidden_states=encoder_hidden_states,
                     attention_mask=attention_mask,
                     use_image_num=use_image_num,
-                    clip_text_feature = clip_text_feature
                 )
             else:
                 sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
@@ -475,7 +471,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
 
         # mid
         sample = self.mid_block(
-            sample, emb, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask, use_image_num=use_image_num, clip_text_feature = clip_text_feature
+            sample, emb, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask, use_image_num=use_image_num,
         )
 
         # up
@@ -499,7 +495,6 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                     upsample_size=upsample_size,
                     attention_mask=attention_mask,
                     use_image_num=use_image_num,
-                    clip_text_feature = clip_text_feature
                 )
             else:
                 sample = upsample_block(
@@ -574,7 +569,6 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
 
         model = cls.from_config(config)
         model_file = os.path.join(pretrained_model_path, WEIGHTS_NAME)
-        print(model_file)
         if not os.path.isfile(model_file):
             raise RuntimeError(f"{model_file} does not exist")
         state_dict = torch.load(model_file, map_location="cpu")
@@ -599,7 +593,7 @@ if __name__ == '__main__':
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    pretrained_model_path = "/home/sreeramagiri.s/xiangyu_bai/code/lavie_long_clip/LaVie/pretrained_models/stable-diffusion-v1-4/" # p cluster
+    pretrained_model_path = "/mnt/petrelfs/maxin/work/pretrained/stable-diffusion-v1-4/" # p cluster
     unet = UNet3DConditionModel.from_pretrained_2d(pretrained_model_path, subfolder="unet").to(device)
     # unet.enable_xformers_memory_efficient_attention(attention_op=MemoryEfficientAttentionFlashAttentionOp)
     unet.enable_xformers_memory_efficient_attention()

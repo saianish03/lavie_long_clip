@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import einops
 import torch
 from packaging import version
-from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
+from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer, CLIPConfig
 
 from diffusers.configuration_utils import FrozenDict
 from diffusers.models import AutoencoderKL
@@ -29,7 +29,14 @@ from diffusers.utils import (
     #randn_tensor,
     replace_example_docstring,
     BaseOutput,
+    USE_PEFT_BACKEND,
+    is_invisible_watermark_available,
+    is_torch_xla_available,
+    scale_lora_layers,
+    unscale_lora_layers,
 )
+
+from diffusers.loaders import StableDiffusionXLLoraLoaderMixin
 
 try:
     from diffusers.utils import randn_tensor
@@ -37,12 +44,16 @@ except:
     from diffusers.utils.torch_utils import randn_tensor
 
 
-from diffusers.pipeline_utils import DiffusionPipeline
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from dataclasses import dataclass
 
 import os, sys
 sys.path.append(os.path.split(sys.path[0])[0])
 from models.unet import UNet3DConditionModel
+
+sys.path.append("/scratch/sreeramagiri.s/lavie_long_clip_encoder_only/LaVie/base/Long-CLIP")
+from open_clip_long import factory as open_clip
+from model import longclip
 
 import numpy as np
 
@@ -99,8 +110,8 @@ class VideoGenPipeline(DiffusionPipeline):
     def __init__(
         self,
         vae: AutoencoderKL,
-        text_encoder: CLIPTextModel,
-        tokenizer: CLIPTokenizer,
+        # text_encoder: CLIPTextModel,
+        # tokenizer: CLIPTokenizer,
         unet: UNet3DConditionModel,
         scheduler: KarrasDiffusionSchedulers,
     ):
@@ -155,16 +166,59 @@ class VideoGenPipeline(DiffusionPipeline):
             new_config = dict(unet.config)
             new_config["sample_size"] = 64
             unet._internal_dict = FrozenDict(new_config)
+        
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        bigG_model, _, bigG_preprocess = open_clip.create_model_and_transforms(
+            'ViT-bigG-14', 
+            pretrained='/scratch/sreeramagiri.s/lavie_long_clip_encoder_only/LaVie/base/Long-CLIP/SDXL/openclip-bigG/open_clip_pytorch_model.bin'
+        )
+        bigG_model = self.kps(bigG_model)
+        bigG_model.eval().cuda()
+        self.bigG_model = bigG_model
+        self.bigG_encoder = bigG_model.encode_text_full
+
+        self.openclip_tokenizer = open_clip.get_tokenizer('ViT-bigG-14')
+
+        vitl_model, vitl_preprocess = longclip.load("/scratch/sreeramagiri.s/lavie_long_clip_encoder_only/LaVie/base/Long-CLIP/SDXL/longclip-L/longclip-L.pt", device=device)
+        vitl_model.eval()
+        self.vitL_encoder = vitl_model.encode_text_full
+        self.long_clip_tokenizer = longclip.tokenize
 
         self.register_modules(
             vae=vae,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
+            # text_encoder=text_encoder,
+            # tokenizer=tokenizer,
             unet=unet,
             scheduler=scheduler,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.unet.config.force_zeros_for_empty_prompt = True
         # self.register_to_config(requires_safety_checker=requires_safety_checker)
+
+    def kps(self, model):
+        positional_embedding_pre = model.positional_embedding       
+        length, dim = positional_embedding_pre.shape
+        keep_len = 20
+        posisitonal_embedding_new = torch.zeros([4*length-3*keep_len, dim])
+        for i in range(keep_len):
+            posisitonal_embedding_new[i] = positional_embedding_pre[i]
+        for i in range(length-1-keep_len):
+            posisitonal_embedding_new[4*i + keep_len] = positional_embedding_pre[i + keep_len]
+            posisitonal_embedding_new[4*i + 1 + keep_len] = 3*positional_embedding_pre[i + keep_len]/4 + 1*positional_embedding_pre[i+1+keep_len]/4
+            posisitonal_embedding_new[4*i + 2+keep_len] = 2*positional_embedding_pre[i+keep_len]/4 + 2*positional_embedding_pre[i+1+keep_len]/4
+            posisitonal_embedding_new[4*i + 3+keep_len] = 1*positional_embedding_pre[i+keep_len]/4 + 3*positional_embedding_pre[i+1+keep_len]/4
+
+        posisitonal_embedding_new[4*length -3*keep_len - 4] = positional_embedding_pre[length-1] + 0*(positional_embedding_pre[length-1] - positional_embedding_pre[length-2])/4
+        posisitonal_embedding_new[4*length -3*keep_len - 3] = positional_embedding_pre[length-1] + 1*(positional_embedding_pre[length-1] - positional_embedding_pre[length-2])/4
+        posisitonal_embedding_new[4*length -3*keep_len - 2] = positional_embedding_pre[length-1] + 2*(positional_embedding_pre[length-1] - positional_embedding_pre[length-2])/4
+        posisitonal_embedding_new[4*length -3*keep_len - 1] = positional_embedding_pre[length-1] + 3*(positional_embedding_pre[length-1] - positional_embedding_pre[length-2])/4
+                
+        positional_embedding_res = posisitonal_embedding_new.clone()
+                
+        model.positional_embedding = torch.nn.Parameter(posisitonal_embedding_new)
+
+        return model
 
     def enable_vae_slicing(self):
         r"""
@@ -267,79 +321,70 @@ class VideoGenPipeline(DiffusionPipeline):
 
     def _encode_prompt(
         self,
-        prompt,
-        device,
+        prompt: str,
         num_images_per_prompt,
         do_classifier_free_guidance,
-        negative_prompt=None,
+        negative_prompt: Optional[str] = None,
         prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        prompt_2: Optional[str] = None,
+        device: Optional[torch.device] = None,
+        negative_prompt_2: Optional[str] = None,
+        pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        lora_scale: Optional[float] = None,
+        clip_skip: Optional[int] = None,
     ):
-        r"""
-        Encodes the prompt into text encoder hidden states.
 
-        Args:
-             prompt (`str` or `List[str]`, *optional*):
-                prompt to be encoded
-            device: (`torch.device`):
-                torch device
-            num_images_per_prompt (`int`):
-                number of images that should be generated per prompt
-            do_classifier_free_guidance (`bool`):
-                whether to use classifier free guidance or not
-            negative_prompt (`str` or `List[str]`, *optional*):
-                The prompt or prompts not to guide the image generation. If not defined, one has to pass
-                `negative_prompt_embeds`. instead. If not defined, one has to pass `negative_prompt_embeds`. instead.
-                Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`).
-            prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
-                provided, text embeddings will be generated from `prompt` input argument.
-            negative_prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
-                weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
-                argument.
-        """
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        text_encoder_1 = self.vitL_encoder
+        tokenizer_1 = self.long_clip_tokenizer
+        text_encoder_2 = self.bigG_encoder
+        tokenizer_2 = self.openclip_tokenizer
+
+        # set lora scale so that monkey patched LoRA
+        # function of text encoder can correctly access it
+        # if lora_scale is not None and isinstance(pipe, StableDiffusionXLLoraLoaderMixin):
+        if lora_scale is not None:
+            # dynamically adjust the LoRA scale
+            if text_encoder_1 is not None:
+                if not USE_PEFT_BACKEND:
+                    adjust_lora_scale_text_encoder(text_encoder_1, lora_scale)
+                else:
+                    scale_lora_layers(text_encoder_1, lora_scale)
+
+            if text_encoder_2 is not None:
+                if not USE_PEFT_BACKEND:
+                    adjust_lora_scale_text_encoder(text_encoder_2, lora_scale)
+                else:
+                    scale_lora_layers(text_encoder_2, lora_scale)
+
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+
+        if prompt is not None:
             batch_size = len(prompt)
         else:
             batch_size = prompt_embeds.shape[0]
 
         if prompt_embeds is None:
-            text_inputs = self.tokenizer(
-                prompt,
-                padding="max_length",
-                max_length=self.tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            text_input_ids = text_inputs.input_ids
-            untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+            text_inputs = tokenizer_1(prompt)
+            text_input_ids = text_inputs
+            untruncated_ids = tokenizer_1(prompt)
 
             if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
                 text_input_ids, untruncated_ids
             ):
-                removed_text = self.tokenizer.batch_decode(
-                    untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1]
+                removed_text = tokenizer_1.decode(
+                    untruncated_ids[:, tokenizer_1.model_max_length - 1 : -1]
                 )
                 logger.warning(
                     "The following part of your input was truncated because CLIP can only handle sequences up to"
-                    f" {self.tokenizer.model_max_length} tokens: {removed_text}"
+                    f" {tokenizer_1.model_max_length} tokens: {removed_text}"
                 )
 
-            if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
-                attention_mask = text_inputs.attention_mask.to(device)
-            else:
-                attention_mask = None
-
-            prompt_embeds = self.text_encoder(
-                text_input_ids.to(device),
-                attention_mask=attention_mask,
+            prompt_embeds = text_encoder_1(
+                text_input_ids.to(device)
             )
-            prompt_embeds = prompt_embeds[0]
-
-        prompt_embeds = prompt_embeds.to(dtype=self.text_encoder.dtype, device=device)
 
         bs_embed, seq_len, _ = prompt_embeds.shape
         # duplicate text embeddings for each generation per prompt, using mps friendly method
@@ -368,30 +413,17 @@ class VideoGenPipeline(DiffusionPipeline):
                 uncond_tokens = negative_prompt
 
             max_length = prompt_embeds.shape[1]
-            uncond_input = self.tokenizer(
-                uncond_tokens,
-                padding="max_length",
-                max_length=max_length,
-                truncation=True,
-                return_tensors="pt",
+            uncond_input = tokenizer_1(uncond_tokens)
+
+            negative_prompt_embeds = text_encoder_1(
+                uncond_input.to(device)
             )
-
-            if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
-                attention_mask = uncond_input.attention_mask.to(device)
-            else:
-                attention_mask = None
-
-            negative_prompt_embeds = self.text_encoder(
-                uncond_input.input_ids.to(device),
-                attention_mask=attention_mask,
-            )
-            negative_prompt_embeds = negative_prompt_embeds[0]
-
+        
         if do_classifier_free_guidance:
             # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
             seq_len = negative_prompt_embeds.shape[1]
 
-            negative_prompt_embeds = negative_prompt_embeds.to(dtype=self.text_encoder.dtype, device=device)
+            negative_prompt_embeds = negative_prompt_embeds.to(dtype=self.unet.dtype, device=device)
 
             negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
             negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
@@ -515,7 +547,6 @@ class VideoGenPipeline(DiffusionPipeline):
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-        **kwargs
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -612,7 +643,6 @@ class VideoGenPipeline(DiffusionPipeline):
         # 3. Encode input prompt
         prompt_embeds = self._encode_prompt(
             prompt,
-            device,
             num_images_per_prompt,
             do_classifier_free_guidance,
             negative_prompt,
@@ -620,9 +650,8 @@ class VideoGenPipeline(DiffusionPipeline):
             negative_prompt_embeds=negative_prompt_embeds,
         )
 
-        # print("Prompt embeds shape: ", prompt_embeds.shape)
-        # print("Prompt embeds:")
-        # print(prompt_embeds)
+        print("prompt_embeds shape: ", prompt_embeds.shape)
+
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
@@ -644,8 +673,6 @@ class VideoGenPipeline(DiffusionPipeline):
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        clip_text_feature = kwargs['clip_text_feature'] # works
-
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -660,7 +687,6 @@ class VideoGenPipeline(DiffusionPipeline):
                     t,
                     encoder_hidden_states=prompt_embeds,
                     # cross_attention_kwargs=cross_attention_kwargs,
-                    clip_text_feature = kwargs['clip_text_feature']
                 ).sample
 
                 # perform guidance

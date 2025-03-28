@@ -18,7 +18,6 @@ from diffusers.models.attention import FeedForward, AdaLayerNorm
 from rotary_embedding_torch import RotaryEmbedding
 from typing import Callable, Optional
 from einops import rearrange, repeat
-# from pipelines.sample import text_features
 
 try:
     from diffusers.models.modeling_utils import ModelMixin
@@ -144,8 +143,7 @@ class CrossAttention(nn.Module):
 
         self._slice_size = slice_size
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, use_image_num=None, **kwargs):
-        
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, use_image_num=None):
         batch_size, sequence_length, _ = hidden_states.shape
 
         encoder_hidden_states = encoder_hidden_states
@@ -160,144 +158,25 @@ class CrossAttention(nn.Module):
         if not self.use_relative_position:
             query = self.reshape_heads_to_batch_dim(query) # [b (h w) nd] f d
         # print('after reshape query shape', query.shape)
-        
-        
-        if encoder_hidden_states is not None:
-            clip_text_feature = kwargs['clip_text_feature'] # works
 
-            # get dtype from hidden_states
-            dtype = encoder_hidden_states.dtype
-            device = encoder_hidden_states.device
+        if self.added_kv_proj_dim is not None:
+            key = self.to_k(hidden_states)
+            value = self.to_v(hidden_states)
+            encoder_hidden_states_key_proj = self.add_k_proj(encoder_hidden_states)
+            encoder_hidden_states_value_proj = self.add_v_proj(encoder_hidden_states)
 
-            # print("Encoder hidden states shape: ", encoder_hidden_states.shape)
-            # print("Clip Text Feature shape: ", clip_text_feature.shape)
+            key = self.reshape_heads_to_batch_dim(key)
+            value = self.reshape_heads_to_batch_dim(value)
+            encoder_hidden_states_key_proj = self.reshape_heads_to_batch_dim(encoder_hidden_states_key_proj)
+            encoder_hidden_states_value_proj = self.reshape_heads_to_batch_dim(encoder_hidden_states_value_proj)
 
-            # split the combined tensor into equal parts
-            split_size = clip_text_feature.shape[0] // 2
-            text_embed, pose_embed = torch.split(clip_text_feature, split_size)
-
-            # ensure consistent dtype
-            text_embed = text_embed.view(1, -1).to(device, dtype=dtype)
-            pose_embed = pose_embed.view(1, -1).to(device, dtype=dtype)
-            
-            # determine which projection size to use based on the module's to_k output dimension
-            k_out_dim = self.to_k.out_features
-            v_out_dim = self.to_v.out_features
-            embed_dim = text_embed.shape[-1]
-            
-            # create projection layers based on output dimension if they don't exist
-            if not hasattr(self, f'W_k_text_{k_out_dim}'):
-                # create projections for 320 dimension
-                self.W_k_text_320 = torch.nn.Linear(embed_dim, 320).to(device, dtype=dtype)
-                self.W_v_text_320 = torch.nn.Linear(embed_dim, 320).to(device, dtype=dtype)
-                self.W_k_pose_320 = torch.nn.Linear(embed_dim, 320).to(device, dtype=dtype)
-                self.W_v_pose_320 = torch.nn.Linear(embed_dim, 320).to(device, dtype=dtype)
-                self.W_k_combined_320 = torch.nn.Linear(320 * 2, 320).to(device, dtype=dtype)
-                self.W_v_combined_320 = torch.nn.Linear(320 * 2, 320).to(device, dtype=dtype)
-                
-                # create projections for 640 dimension
-                self.W_k_text_640 = torch.nn.Linear(embed_dim, 640).to(device, dtype=dtype)
-                self.W_v_text_640 = torch.nn.Linear(embed_dim, 640).to(device, dtype=dtype)
-                self.W_k_pose_640 = torch.nn.Linear(embed_dim, 640).to(device, dtype=dtype)
-                self.W_v_pose_640 = torch.nn.Linear(embed_dim, 640).to(device, dtype=dtype)
-                self.W_k_combined_640 = torch.nn.Linear(640 * 2, 640).to(device, dtype=dtype)
-                self.W_v_combined_640 = torch.nn.Linear(640 * 2, 640).to(device, dtype=dtype)
-                
-                # create projections for 1280 dimension
-                self.W_k_text_1280 = torch.nn.Linear(embed_dim, 1280).to(device, dtype=dtype)
-                self.W_v_text_1280 = torch.nn.Linear(embed_dim, 1280).to(device, dtype=dtype)
-                self.W_k_pose_1280 = torch.nn.Linear(embed_dim, 1280).to(device, dtype=dtype)
-                self.W_v_pose_1280 = torch.nn.Linear(embed_dim, 1280).to(device, dtype=dtype)
-                self.W_k_combined_1280 = torch.nn.Linear(1280 * 2, 1280).to(device, dtype=dtype)
-                self.W_v_combined_1280 = torch.nn.Linear(1280 * 2, 1280).to(device, dtype=dtype)
-                
-                # initialize all weights
-                for size in [320, 640, 1280]:
-                    torch.nn.init.normal_(getattr(self, f'W_k_text_{size}').weight, std=0.02)
-                    torch.nn.init.normal_(getattr(self, f'W_v_text_{size}').weight, std=0.02)
-                    torch.nn.init.normal_(getattr(self, f'W_k_pose_{size}').weight, std=0.02)
-                    torch.nn.init.normal_(getattr(self, f'W_v_pose_{size}').weight, std=0.02)
-                    torch.nn.init.normal_(getattr(self, f'W_k_combined_{size}').weight, std=0.02)
-                    torch.nn.init.normal_(getattr(self, f'W_v_combined_{size}').weight, std=0.02)
-            else:
-                # ensure existing layers have the correct dtype
-                for size in [320, 640, 1280]:
-                    getattr(self, f'W_k_text_{size}').to(device, dtype=dtype)
-                    getattr(self, f'W_v_text_{size}').to(device, dtype=dtype)
-                    getattr(self, f'W_k_pose_{size}').to(device, dtype=dtype)
-                    getattr(self, f'W_v_pose_{size}').to(device, dtype=dtype)
-                    getattr(self, f'W_k_combined_{size}').to(device, dtype=dtype)
-                    getattr(self, f'W_v_combined_{size}').to(device, dtype=dtype)
-            
-            # select the appropriate projection layers based on the current output dimension
-            W_k_text = getattr(self, f'W_k_text_{k_out_dim}')
-            W_v_text = getattr(self, f'W_v_text_{v_out_dim}')
-            W_k_pose = getattr(self, f'W_k_pose_{k_out_dim}')
-            W_v_pose = getattr(self, f'W_v_pose_{v_out_dim}')
-            W_k_combined = getattr(self, f'W_k_combined_{k_out_dim}')
-            W_v_combined = getattr(self, f'W_v_combined_{v_out_dim}')
-            
-            # apply selected projections
-            text_key = W_k_text(text_embed)
-            pose_key = W_k_pose(pose_embed)
-            text_value = W_v_text(text_embed)
-            pose_value = W_v_pose(pose_embed)
-
-            batch_size = encoder_hidden_states.shape[0]  
-            seq_length = 77  # From your expected shape
-
-            # reshape/expand text_key from [1, 1, ...] to [32, 77, ...]
-            text_key = text_key.expand(batch_size, seq_length, -1)
-            pose_key = pose_key.expand(batch_size, seq_length, -1)
-            text_value = text_value.expand(batch_size, seq_length, -1)
-            pose_value = pose_value.expand(batch_size, seq_length, -1)
-
-            # stack horizontally (concatenate along the last dimension)
-            combined_key = torch.cat([text_key, pose_key], dim=-1)
-            combined_value = torch.cat([text_value, pose_value], dim=-1)
-
-            # project back to original dimensions
-            key = W_k_combined(combined_key)
-            value = W_v_combined(combined_value)
-            
-            if not self.use_relative_position:
-                key = self.reshape_heads_to_batch_dim(key) # [b (h w) nd] f d
-                value = self.reshape_heads_to_batch_dim(value)
-        
-        # Instead of generating key and value from encoder_hidden_states, use the text_features tensor and apply linear projections to get key and value
-        
-        # text_features has shape [2, 2, 512]
-        # We need to ensure it has the right dimensionality for our attention mechanism
-        
-        # Project text_features to match the expected dimension
-        # The linear projections should convert from 512 to dim (which is heads * dim_head)
-        #text_features_reshaped = text_features.to(hidden_states.device, dtype=hidden_states.dtype)
-        
-        
-        # key = self.to_k(text_features_reshaped)  # Project from text embedding dim to inner_dim
-        # value = self.to_v(text_features_reshaped)  # Project from text embedding dim to inner_dim
-
-        # if self.added_kv_proj_dim is not None:
-        #     key = self.to_k(hidden_states)
-        #     value = self.to_v(hidden_states)
-        #     # if encoder_hidden_states is not None:
-        #     #     print("original key shape: ", key.shape)
-        #     #     print("original value shape: ", value.shape)
-        #         # return
-        #     encoder_hidden_states_key_proj = self.add_k_proj(encoder_hidden_states)
-        #     encoder_hidden_states_value_proj = self.add_v_proj(encoder_hidden_states)
-
-        #     key = self.reshape_heads_to_batch_dim(key)
-        #     value = self.reshape_heads_to_batch_dim(value)
-        #     encoder_hidden_states_key_proj = self.reshape_heads_to_batch_dim(encoder_hidden_states_key_proj)
-        #     encoder_hidden_states_value_proj = self.reshape_heads_to_batch_dim(encoder_hidden_states_value_proj)
-
-        #     key = torch.concat([encoder_hidden_states_key_proj, key], dim=1)
-        #     value = torch.concat([encoder_hidden_states_value_proj, value], dim=1)
-        if encoder_hidden_states is None:
+            key = torch.concat([encoder_hidden_states_key_proj, key], dim=1)
+            value = torch.concat([encoder_hidden_states_value_proj, value], dim=1)
+        else:
             encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
             key = self.to_k(encoder_hidden_states)
             value = self.to_v(encoder_hidden_states)
+            
             if not self.use_relative_position:
                 key = self.reshape_heads_to_batch_dim(key)
                 value = self.reshape_heads_to_batch_dim(value)
@@ -476,7 +355,7 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
         else:
             self.proj_out = nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, use_image_num=None, return_dict: bool = True, **kwargs):
+    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, use_image_num=None, return_dict: bool = True):
         # Input
         assert hidden_states.dim() == 5, f"Expected hidden_states to have ndim=5, but got ndim={hidden_states.dim()}."
 
@@ -486,9 +365,6 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
 
         batch, channel, height, weight = hidden_states.shape
         residual = hidden_states
-        
-        if encoder_hidden_states is not None:
-            clip_text_feature = kwargs['clip_text_feature'] # works
 
         hidden_states = self.norm(hidden_states)
         if not self.use_linear_projection:
@@ -508,7 +384,6 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
                 timestep=timestep,
                 video_length=video_length,
                 use_image_num=use_image_num,
-                clip_text_feature = clip_text_feature if encoder_hidden_states is not None else None
             )
 
         # Output
@@ -633,13 +508,11 @@ class BasicTransformerBlock(nn.Module):
                 self.attn2._use_memory_efficient_attention_xformers = use_memory_efficient_attention_xformers
             # self.attn_temp._use_memory_efficient_attention_xformers = use_memory_efficient_attention_xformers
 
-    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, attention_mask=None, video_length=None, use_image_num=None, **kwargs):
+    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, attention_mask=None, video_length=None, use_image_num=None):
         # SparseCausal-Attention
         norm_hidden_states = (
             self.norm1(hidden_states, timestep) if self.use_ada_layer_norm else self.norm1(hidden_states)
         )
-
-        clip_text_feature = kwargs['clip_text_feature'] # works
 
         if self.only_cross_attention:
             hidden_states = (
@@ -655,7 +528,7 @@ class BasicTransformerBlock(nn.Module):
             )
             hidden_states = (
                 self.attn2(
-                    norm_hidden_states, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask, clip_text_feature = clip_text_feature
+                    norm_hidden_states, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask
                 )
                 + hidden_states
             )
